@@ -159,6 +159,18 @@ tree_id = root_turn_id
 | `agent_final_join` | Structured agent message of type `FINAL_ANSWER`: the author's last completed response before the message was sent ──▶ the request whose input surfaces the message |
 | `agent_message_delivery` | Same, for message types `MESSAGE` / `NEW_TASK` |
 
+Agent identity evidence is separate from an executable dependency. If no
+same-tree spawn response is available, inference also checks the first captured
+parent request's recorded `body.input` for a matching `spawn_agent` call **and**
+result. `spawn_history_only` proves the logical parent/child path, but does not
+create a `spawn` edge: that prompt may have arrived after the child began, and
+the original spawn response timestamp is unavailable. A matching earlier
+segment of the same `(session_id, thread_id, agent_name)` is marked
+`cross_tree_continuation` when `root_turn_id` splits a thread; it is not treated
+as a new spawn. Both statuses remain excluded from strict default replay until
+an executable cross-tree/untimed scheduling policy is chosen. Their evidence
+is recorded in `diagnostics`.
+
 **3. Waits are aggregate external gaps, not per-tool latency.** The logs contain no
 tool start/end events, so the only recoverable quantity is:
 
@@ -168,15 +180,21 @@ edge_delay = next_request.recorded_at − previous_response.finished_at
 ```
 
 `causal` scheduling reproduces this delay at replay time. Several tool calls inside
-one gap cannot be split apart.
+one gap cannot be split apart. `recorded_at` is the server-side request trace's
+arrival timestamp, not a client-side send timestamp. If the previous response
+is missing, the difference between two request arrivals also includes the
+unknown LLM duration and cannot be attributed to tool execution.
 
 **4. A tree is replayable iff its graph is closed.**
 
 ```text
 replayable  ⇔  every request is eligible (paired completed response, has thread_id)
-            ∧  every agent's parent relation is resolved
+            ∧  every agent has an executable same-tree parent relation
 ```
 
-Trees that fail are marked `partial` or `unreplayable`; they stay in the index but are
-not selected by default. `replayable` means the graph is closed, not that every edge is
-high confidence; filter on each edge's `confidence` for sensitivity analysis.
+`capture_status` separately reports whether all, some, or none of the requests
+are individually eligible (`complete`, `partial`, `unreplayable`). A `complete`
+tree can still be `replayable=0` because its agent relation is logical-only.
+Strict default replay selects only `replayable=1` trees. This means the graph
+is closed, not that every edge is high confidence; filter on each edge's
+`confidence` for sensitivity analysis.

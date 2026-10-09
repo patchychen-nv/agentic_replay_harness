@@ -607,6 +607,213 @@ def _control_calls(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     )
 
 
+def _historical_spawn_targets(items: Any, parent_name: str) -> dict[str, set[str]]:
+    """Find spawn calls confirmed by their result in a recorded prompt.
+
+    Prompt history can prove the logical parent/child identity, but it does not
+    identify the response request or timestamp that originally emitted the
+    call.  Keep this evidence separate from executable dependency edges.
+    """
+    if not isinstance(items, list):
+        return {}
+    calls: dict[str, set[str]] = defaultdict(set)
+    outputs: dict[str, set[str]] = defaultdict(set)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if item.get("type") == "function_call" and item.get("name") == "spawn_agent":
+            task_name = parse_json_object(item.get("arguments")).get("task_name")
+            if isinstance(task_name, str) and task_name:
+                target = (
+                    task_name
+                    if task_name.startswith("/")
+                    else f"{parent_name.rstrip('/')}/{task_name}"
+                )
+                calls[call_id].add(target)
+        elif item.get("type") == "function_call_output":
+            result = parse_json_object(item.get("output"))
+            for key in ("task_name", "canonical_task_name", "agent_name"):
+                target = result.get(key)
+                if isinstance(target, str) and target.startswith("/"):
+                    outputs[call_id].add(target)
+    targets: dict[str, set[str]] = defaultdict(set)
+    for call_id, called_targets in calls.items():
+        # Reject contradictory histories rather than choosing a convenient
+        # parent/child pairing from a reused call ID.
+        if len(called_targets) == 1 and outputs.get(call_id) == called_targets:
+            targets[next(iter(called_targets))].add(call_id)
+    return targets
+
+
+def _first_request_input(
+    connection: sqlite3.Connection,
+    request_id: str,
+    handles: dict[Path, Any],
+) -> Any:
+    row = connection.execute(
+        """
+        SELECT s.absolute_path, q.line_offset, q.line_length
+        FROM requests q JOIN sources s ON s.source_id=q.source_id
+        WHERE q.trace_id=?
+        """,
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    path = Path(str(row["absolute_path"]))
+    try:
+        handle = handles.get(path)
+        if handle is None:
+            handle = path.open("rb")
+            handles[path] = handle
+        handle.seek(int(row["line_offset"]))
+        record = json.loads(handle.read(int(row["line_length"])))
+    except (OSError, ValueError) as error:
+        _insert_diagnostic(
+            connection,
+            "warning",
+            "spawn_history_unreadable",
+            request_id,
+            {"source_path": str(path), "error": str(error)},
+        )
+        return None
+    body = record.get("body") if isinstance(record, dict) else None
+    return body.get("input") if isinstance(body, dict) else None
+
+
+def _infer_logical_agent_relations(
+    connection: sqlite3.Connection,
+    agents: dict[tuple[str, str], AgentAccumulator],
+    response_by_request: dict[str, sqlite3.Row],
+    by_tree_name: dict[str, dict[str, AgentAccumulator]],
+) -> None:
+    """Annotate identities recoverable without a same-tree spawn response.
+
+    Neither branch creates a spawn dependency: a historical prompt may be
+    observed *after* the child starts, and a cross-tree segment is a resumed
+    thread rather than a second spawn.  Strict replay still excludes these
+    trees until an executable causal schedule is available.
+    """
+    segments: dict[tuple[str, str, str], list[AgentAccumulator]] = defaultdict(list)
+    for candidate in agents.values():
+        if candidate.session_id and candidate.agent_name:
+            segments[
+                (candidate.session_id, candidate.thread_id, candidate.agent_name)
+            ].append(candidate)
+    for candidate_segments in segments.values():
+        candidate_segments.sort(key=lambda candidate: candidate.first_send_ts)
+
+    history_by_parent: dict[str, dict[str, set[str]]] = {}
+    handles: dict[Path, Any] = {}
+    try:
+        for agent in sorted(
+            agents.values(), key=lambda candidate: candidate.first_send_ts
+        ):
+            if agent.relation_status not in {"missing_parent_agent", "parent_path_only"}:
+                continue
+            if not agent.agent_name or not agent.parent_agent_name:
+                continue
+
+            # A new root_turn_id can split one thread into several trees.  Its
+            # original spawn belongs to the earlier segment, not this one.
+            prior_segments = [
+                prior
+                for prior in segments.get(
+                    (agent.session_id, agent.thread_id, agent.agent_name), []
+                )
+                if prior.tree_id != agent.tree_id
+                and prior.parent_agent_name == agent.parent_agent_name
+                and prior.last_send_ts < agent.first_send_ts
+                and prior.relation_status
+                in {
+                    "spawn_matched",
+                    "spawn_history_only",
+                    "cross_tree_continuation",
+                }
+            ]
+            if prior_segments:
+                prior = max(prior_segments, key=lambda candidate: candidate.last_send_ts)
+                response = response_by_request.get(prior.last_request_id)
+                finish_ts = (
+                    float(response["finish_ts"])
+                    if response is not None and response["finish_ts"] is not None
+                    else None
+                )
+                if finish_ts is None or finish_ts <= agent.first_send_ts + 1e-6:
+                    agent.relation_status = "cross_tree_continuation"
+                    _insert_diagnostic(
+                        connection,
+                        "info",
+                        "cross_tree_agent_continuation",
+                        agent.first_request_id,
+                        {
+                            "agent_name": agent.agent_name,
+                            "prior_tree_id": prior.tree_id,
+                            "prior_last_request_id": prior.last_request_id,
+                            "prior_relation_status": prior.relation_status,
+                            "interarrival_gap_s": agent.first_send_ts - prior.last_send_ts,
+                            "post_response_gap_s": (
+                                agent.first_send_ts - finish_ts
+                                if finish_ts is not None
+                                else None
+                            ),
+                            "executable_edge_created": False,
+                        },
+                    )
+                    continue
+
+            parent = by_tree_name[agent.tree_id].get(agent.parent_agent_name)
+            if (
+                parent is None
+                or not parent.session_id
+                or parent.session_id != agent.session_id
+            ):
+                continue
+            if parent.first_request_id not in history_by_parent:
+                items = _first_request_input(connection, parent.first_request_id, handles)
+                history_by_parent[parent.first_request_id] = _historical_spawn_targets(
+                    items, agent.parent_agent_name
+                )
+            call_ids = history_by_parent[parent.first_request_id].get(
+                agent.agent_name, set()
+            )
+            if len(call_ids) != 1:
+                if len(call_ids) > 1:
+                    _insert_diagnostic(
+                        connection,
+                        "warning",
+                        "spawn_history_ambiguous",
+                        agent.first_request_id,
+                        {
+                            "parent_request_id": parent.first_request_id,
+                            "call_ids": sorted(call_ids),
+                        },
+                    )
+                continue
+            agent.relation_status = "spawn_history_only"
+            _insert_diagnostic(
+                connection,
+                "info",
+                "spawn_history_logical_relation",
+                agent.first_request_id,
+                {
+                    "call_id": next(iter(call_ids)),
+                    "agent_name": agent.agent_name,
+                    "parent_agent_name": agent.parent_agent_name,
+                    "observed_in_request_id": parent.first_request_id,
+                    "source_response_request_id": None,
+                    "spawn_finish_ts": None,
+                    "executable_edge_created": False,
+                },
+            )
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
 def _infer_agent_edges(
     connection: sqlite3.Connection,
     agents: dict[tuple[str, str], AgentAccumulator],
@@ -631,17 +838,6 @@ def _infer_agent_edges(
         parent = tree_agents.get(agent.parent_agent_name)
         if parent is None:
             agent.relation_status = "missing_parent_agent"
-            _insert_diagnostic(
-                connection,
-                "error",
-                "missing_parent_agent",
-                agent.first_request_id,
-                {
-                    "tree_id": agent.tree_id,
-                    "agent_name": agent.agent_name,
-                    "expected_parent": agent.parent_agent_name,
-                },
-            )
             continue
 
         exact: list[sqlite3.Row] = []
@@ -662,17 +858,6 @@ def _infer_agent_edges(
         candidates = exact or fallback
         if not candidates:
             agent.relation_status = "parent_path_only"
-            _insert_diagnostic(
-                connection,
-                "warning",
-                "spawn_call_not_found",
-                agent.first_request_id,
-                {
-                    "tree_id": agent.tree_id,
-                    "agent_name": agent.agent_name,
-                    "parent_agent_name": agent.parent_agent_name,
-                },
-            )
             continue
         chosen = max(candidates, key=lambda row: float(row["finish_ts"]))
         delay = max(agent.first_send_ts - float(chosen["finish_ts"]), 0.0)
@@ -699,8 +884,34 @@ def _infer_agent_edges(
         )
         agent.relation_status = "spawn_matched" if exact else "spawn_inferred"
 
+    _infer_logical_agent_relations(connection, agents, response_by_request, by_tree_name)
+
     # Persist relation status after matching.
     for agent in agents.values():
+        if agent.relation_status == "missing_parent_agent":
+            _insert_diagnostic(
+                connection,
+                "error",
+                "missing_parent_agent",
+                agent.first_request_id,
+                {
+                    "tree_id": agent.tree_id,
+                    "agent_name": agent.agent_name,
+                    "expected_parent": agent.parent_agent_name,
+                },
+            )
+        elif agent.relation_status == "parent_path_only":
+            _insert_diagnostic(
+                connection,
+                "warning",
+                "spawn_call_not_found",
+                agent.first_request_id,
+                {
+                    "tree_id": agent.tree_id,
+                    "agent_name": agent.agent_name,
+                    "parent_agent_name": agent.parent_agent_name,
+                },
+            )
         connection.execute(
             "UPDATE agents SET relation_status=? WHERE tree_id=? AND thread_id=?",
             (agent.relation_status, agent.tree_id, agent.thread_id),
@@ -939,7 +1150,9 @@ def _build_trees(connection: sqlite3.Connection) -> None:
         agent_stats = connection.execute(
             """
             SELECT COUNT(*) AS agent_count,
-                   SUM(CASE WHEN relation_status IN ('missing_parent_agent', 'parent_path_only', 'unresolved')
+                   SUM(CASE WHEN relation_status IN (
+                       'missing_parent_agent', 'parent_path_only', 'unresolved',
+                       'spawn_history_only', 'cross_tree_continuation')
                             THEN 1 ELSE 0 END) AS unresolved
             FROM agents WHERE tree_id=?
             """,
