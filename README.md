@@ -117,6 +117,7 @@ Common flags:
 | `--schedule asap` | Dependencies only; all recorded waits removed |
 | `--root-schedule recorded\|simultaneous` | Keep recorded offsets between tree roots, or release them together (causal only) |
 | `--speedup N` | Divide recorded waits and arrival offsets by N |
+| `--concurrency N` | Limit concurrent HTTP requests (default 128); `0` removes both client request and connection limits, while retaining dependency and timing gates |
 | `--fixed-output-length` | Set `max_output_tokens` to recorded OSL and add `ignore_eos`; by default source output controls are untouched |
 | `--payload-mode live-chain` | Experimental: replace the parent-response slice in the next request with live output |
 | `--allow-partial` | Also replay eligible requests from incomplete trees; changes the workload |

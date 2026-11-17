@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
@@ -71,6 +72,10 @@ class ReplayOptions:
     payload_mode: str = "recorded"
     chain_mismatch_policy: str = "error"
     dry_run: bool = False
+
+    def __post_init__(self) -> None:
+        if self.concurrency < 0:
+            raise ValueError("concurrency must be non-negative (0 means unlimited)")
 
 
 class ChainMismatchError(ValueError):
@@ -1128,14 +1133,20 @@ async def run_replay(
     ready_count = 0
     wall_started = 0.0
     loop_started = 0.0
-    semaphore = asyncio.Semaphore(options.concurrency)
+    # A zero-valued Semaphore never releases requests; unlimited mode must
+    # bypass it entirely as well as disabling the HTTP connector's limits.
+    request_slots = (
+        asyncio.Semaphore(options.concurrency)
+        if options.concurrency > 0
+        else nullcontext()
+    )
     counters: defaultdict[str, int] = defaultdict(int)
     output_fidelity: defaultdict[str, int] = defaultdict(int)
     chain_fidelity: defaultdict[str, int] = defaultdict(int)
     usage_totals: defaultdict[str, int] = defaultdict(int)
     request_control_totals: defaultdict[str, int] = defaultdict(int)
     request_timeout = aiohttp.ClientTimeout(total=options.timeout_s)
-    connector = aiohttp.TCPConnector(limit=max(options.concurrency, 1))
+    connector = aiohttp.TCPConnector(limit=options.concurrency, limit_per_host=0)
 
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if options.api_key:
@@ -1257,7 +1268,7 @@ async def run_replay(
                         request_headers["X-Session-ID"] = node.session_id
                         request_headers["X-Correlation-ID"] = node.session_id
                     url = options.base_url.rstrip("/") + (options.endpoint or node.route)
-                    async with semaphore:
+                    async with request_slots:
                         request_started = time.monotonic()
                         result["scheduled_offset_s"] = due - loop_started
                         result["actual_start_offset_s"] = request_started - loop_started

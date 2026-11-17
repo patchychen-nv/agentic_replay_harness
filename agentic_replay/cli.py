@@ -34,6 +34,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
 def _print(value: Any) -> None:
     print(json_dumps(value, pretty=True))
 
@@ -220,7 +227,12 @@ def _add_replay_arguments(parser: argparse.ArgumentParser) -> None:
         default=1.0,
         help="Divide recorded waits by this factor.",
     )
-    parser.add_argument("--concurrency", type=_positive_int, default=128)
+    parser.add_argument(
+        "--concurrency",
+        type=_nonnegative_int,
+        default=128,
+        help="Maximum concurrent HTTP requests; 0 removes client concurrency limits.",
+    )
     parser.add_argument("--timeout", type=_positive_float, default=3600.0)
     output_length = parser.add_mutually_exclusive_group()
     output_length.add_argument(
